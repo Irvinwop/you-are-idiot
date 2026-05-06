@@ -33,5 +33,10 @@ else()
 endif()
 
 if(MINGW)
-    target_link_options(you_are_idiot PRIVATE -municode)
+    target_link_options(you_are_idiot PRIVATE
+        -municode
+        -static
+        -static-libgcc
+        -static-libstdc++
+    )
 endif()
