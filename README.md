@@ -23,9 +23,7 @@ cmake --build build-mingw
 ## Runtime options
 
 ```text
---windows N    Number of prank windows, clamped to 1..24. Default: 10
 --fps N        Animation timer rate, clamped to 15..240. Default: 120
---spawn-ms N   Delay between clone windows, clamped to 250..10000. Default: 700
 --media PATH   MP4 file to decode. Default: media\youare.mp4
 --audio PATH   WAV file to loop. Default: media\youare.wav
 --no-topmost   Do not keep prank windows above other windows.

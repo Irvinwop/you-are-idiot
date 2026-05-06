@@ -24,7 +24,6 @@ constexpr wchar_t kWindowClass[] = L"YouAreIdiotNativeWindow";
 constexpr wchar_t kDefaultMediaPath[] = L"media\\youare.mp4";
 constexpr wchar_t kDefaultAudioPath[] = L"media\\youare.wav";
 constexpr UINT_PTR kFrameTimer = 1;
-constexpr UINT_PTR kSpawnTimer = 2;
 constexpr int kQuitHotkeyId = 100;
 constexpr int kArrowCursorResource = 32512;
 constexpr int kWarningIconResource = 32515;
@@ -78,7 +77,6 @@ private:
 struct Settings {
     unsigned int maxWindows = -1;
     int fps = 120;
-    int spawnMs = 700;
     bool topmost = true;
     bool sound = true;
     bool dodgeCursor = true;
@@ -97,10 +95,71 @@ struct WindowState {
     double vx = 0.0;
     double vy = 0.0;
     ULONGLONG lastFrameAt = 0;
+    std::uint32_t audioVoiceId = 0;
 };
 
 class VideoPlayback {
 public:
+    VideoPlayback() {
+        InitializeCriticalSection(&frameLock_);
+    }
+
+    ~VideoPlayback() {
+        Stop();
+        DeleteCriticalSection(&frameLock_);
+    }
+
+    HRESULT Start(const std::wstring& path) {
+        workerPath_ = path;
+        startupHr_ = E_PENDING;
+        stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (stopEvent_ == nullptr || readyEvent_ == nullptr) {
+            Stop();
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+
+        workerThread_ = CreateThread(nullptr, 0, &VideoPlayback::ThreadEntry, this, 0, nullptr);
+        if (workerThread_ == nullptr) {
+            const HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+            Stop();
+            return hr;
+        }
+
+        WaitForSingleObject(readyEvent_, INFINITE);
+        return startupHr_;
+    }
+
+    void Stop() {
+        if (stopEvent_ != nullptr) {
+            SetEvent(stopEvent_);
+        }
+
+        if (workerThread_ != nullptr) {
+            WaitForSingleObject(workerThread_, INFINITE);
+            CloseHandle(workerThread_);
+            workerThread_ = nullptr;
+        }
+
+        if (readyEvent_ != nullptr) {
+            CloseHandle(readyEvent_);
+            readyEvent_ = nullptr;
+        }
+
+        if (stopEvent_ != nullptr) {
+            CloseHandle(stopEvent_);
+            stopEvent_ = nullptr;
+        }
+    }
+
+    void LockFrame() {
+        EnterCriticalSection(&frameLock_);
+    }
+
+    void UnlockFrame() {
+        LeaveCriticalSection(&frameLock_);
+    }
+
     HRESULT Open(const std::wstring& path) {
         path_ = path;
 
@@ -142,9 +201,11 @@ public:
     }
 
     void Close() {
+        EnterCriticalSection(&frameLock_);
         reader_.Reset();
         pixels_.clear();
         hasFrame_ = false;
+        LeaveCriticalSection(&frameLock_);
     }
 
     void Advance() {
@@ -201,6 +262,37 @@ public:
     }
 
 private:
+    static DWORD WINAPI ThreadEntry(void* context) {
+        return static_cast<VideoPlayback*>(context)->RunThread();
+    }
+
+    DWORD RunThread() {
+        const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool uninitializeCom = SUCCEEDED(coHr);
+
+        HRESULT hr = Open(workerPath_);
+        startupHr_ = hr;
+        SetEvent(readyEvent_);
+        if (FAILED(hr)) {
+            Close();
+            if (uninitializeCom) {
+                CoUninitialize();
+            }
+            return 1;
+        }
+
+        const DWORD waitMs = std::max<DWORD>(1, static_cast<DWORD>(frameDuration100ns_ / 20000));
+        while (WaitForSingleObject(stopEvent_, waitMs) == WAIT_TIMEOUT) {
+            Advance();
+        }
+
+        Close();
+        if (uninitializeCom) {
+            CoUninitialize();
+        }
+        return 0;
+    }
+
     HRESULT ConfigureRgbOutput() {
         HRESULT hr = ConfigureRgbOutput(kClientWidth, kClientHeight);
         if (SUCCEEDED(hr)) {
@@ -260,10 +352,6 @@ private:
             return FAILED(hr) ? hr : E_FAIL;
         }
 
-        width_ = width;
-        height_ = height;
-        pixels_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4u, 0);
-
         UINT32 numerator = 0;
         UINT32 denominator = 0;
         if (SUCCEEDED(MFGetAttributeRatio(actualType.Get(), MF_MT_FRAME_RATE, &numerator, &denominator)) &&
@@ -275,6 +363,11 @@ private:
                                       static_cast<unsigned long long>(numerator)));
         }
 
+        EnterCriticalSection(&frameLock_);
+        width_ = width;
+        height_ = height;
+        pixels_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4u, 0);
+
         std::memset(&bitmapInfo_, 0, sizeof(bitmapInfo_));
         bitmapInfo_.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bitmapInfo_.bmiHeader.biWidth = static_cast<LONG>(width_);
@@ -284,6 +377,7 @@ private:
         bitmapInfo_.bmiHeader.biCompression = BI_RGB;
         bitmapInfo_.bmiHeader.biSizeImage =
             static_cast<DWORD>(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4u);
+        LeaveCriticalSection(&frameLock_);
 
         return S_OK;
     }
@@ -394,18 +488,21 @@ private:
             return hr;
         }
 
+        EnterCriticalSection(&frameLock_);
         const LONG pitch = static_cast<LONG>(width_ * 4u);
         const LONG rows = std::min<LONG>(static_cast<LONG>(height_), static_cast<LONG>(currentLength / pitch));
         const std::size_t rowBytes = static_cast<std::size_t>(pitch);
         for (LONG y = 0; y < rows; ++y) {
             std::memcpy(pixels_.data() + static_cast<std::size_t>(y) * rowBytes, data + static_cast<std::size_t>(y) * rowBytes, rowBytes);
         }
+        LeaveCriticalSection(&frameLock_);
 
         buffer->Unlock();
         return S_OK;
     }
 
     void CopyRows(const BYTE* source, LONG sourcePitch) {
+        EnterCriticalSection(&frameLock_);
         const auto destinationPitch = static_cast<std::size_t>(width_) * 4u;
         const auto sourceRowBytes = static_cast<std::size_t>(std::abs(sourcePitch));
         const auto copyBytes = std::min(destinationPitch, sourceRowBytes);
@@ -415,6 +512,7 @@ private:
             std::uint8_t* destinationRow = pixels_.data() + static_cast<std::size_t>(y) * destinationPitch;
             std::memcpy(destinationRow, sourceRow, copyBytes);
         }
+        LeaveCriticalSection(&frameLock_);
     }
 
     void SetError(const wchar_t* message, HRESULT hr) {
@@ -424,7 +522,13 @@ private:
     }
 
     std::wstring path_;
+    std::wstring workerPath_;
     ComPtr<IMFSourceReader> reader_;
+    CRITICAL_SECTION frameLock_{};
+    HANDLE workerThread_ = nullptr;
+    HANDLE stopEvent_ = nullptr;
+    HANDLE readyEvent_ = nullptr;
+    HRESULT startupHr_ = E_PENDING;
     UINT32 width_ = 0;
     UINT32 height_ = 0;
     LONGLONG frameDuration100ns_ = 166833;
@@ -440,26 +544,285 @@ bool FileExists(const std::wstring& path);
 
 class AudioPlayback {
 public:
+    AudioPlayback() {
+        InitializeCriticalSection(&voicesLock_);
+    }
+
+    ~AudioPlayback() {
+        Stop();
+        DeleteCriticalSection(&voicesLock_);
+    }
+
     bool Start(const std::wstring& path) {
         path_ = path;
-        if (!FileExists(path_)) {
+        if (!FileExists(path_) || !LoadWave(path_)) {
             return false;
         }
 
-        playing_ = PlaySoundW(path_.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_LOOP | SND_NODEFAULT) != FALSE;
-        return playing_;
+        stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (stopEvent_ == nullptr) {
+            return false;
+        }
+
+        thread_ = CreateThread(nullptr, 0, &AudioPlayback::ThreadEntry, this, 0, nullptr);
+        if (thread_ == nullptr) {
+            CloseHandle(stopEvent_);
+            stopEvent_ = nullptr;
+            return false;
+        }
+
+        return true;
     }
 
     void Stop() {
-        if (playing_) {
-            PlaySoundW(nullptr, nullptr, 0);
-            playing_ = false;
+        if (stopEvent_ != nullptr) {
+            SetEvent(stopEvent_);
+        }
+
+        if (thread_ != nullptr) {
+            WaitForSingleObject(thread_, INFINITE);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+
+        if (stopEvent_ != nullptr) {
+            CloseHandle(stopEvent_);
+            stopEvent_ = nullptr;
         }
     }
 
+    void AddVoice(std::uint32_t id) {
+        if (totalFrames_ == 0) {
+            return;
+        }
+
+        EnterCriticalSection(&voicesLock_);
+        const auto offset = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(id) * 11407ull + GetTickCount64()) %
+            static_cast<std::uint64_t>(totalFrames_));
+        voices_.push_back({id, offset});
+        LeaveCriticalSection(&voicesLock_);
+    }
+
+    void RemoveVoice(std::uint32_t id) {
+        EnterCriticalSection(&voicesLock_);
+        voices_.erase(
+            std::remove_if(
+                voices_.begin(),
+                voices_.end(),
+                [id](const Voice& voice) {
+                    return voice.id == id;
+                }),
+            voices_.end());
+        LeaveCriticalSection(&voicesLock_);
+    }
+
 private:
-    bool playing_ = false;
+    struct Voice {
+        std::uint32_t id = 0;
+        std::uint32_t offsetFrames = 0;
+    };
+
+    static DWORD WINAPI ThreadEntry(void* context) {
+        return static_cast<AudioPlayback*>(context)->RunThread();
+    }
+
+    DWORD RunThread() {
+        WAVEFORMATEX format{};
+        format.wFormatTag = WAVE_FORMAT_PCM;
+        format.nChannels = 2;
+        format.nSamplesPerSec = sampleRate_;
+        format.wBitsPerSample = 16;
+        format.nBlockAlign = static_cast<WORD>(format.nChannels * format.wBitsPerSample / 8);
+        format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+        HANDLE doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (doneEvent == nullptr) {
+            return 1;
+        }
+
+        HWAVEOUT waveOut = nullptr;
+        MMRESULT result = waveOutOpen(&waveOut, WAVE_MAPPER, &format, reinterpret_cast<DWORD_PTR>(doneEvent), 0, CALLBACK_EVENT);
+        if (result != MMSYSERR_NOERROR) {
+            CloseHandle(doneEvent);
+            return 1;
+        }
+
+        constexpr std::size_t kBufferCount = 4;
+        constexpr std::size_t kFramesPerBuffer = 1024;
+        std::vector<std::vector<std::int16_t>> buffers(kBufferCount);
+        std::vector<WAVEHDR> headers(kBufferCount);
+
+        for (std::size_t i = 0; i < kBufferCount; ++i) {
+            buffers[i].resize(kFramesPerBuffer * 2);
+            FillBuffer(buffers[i].data(), kFramesPerBuffer);
+            std::memset(&headers[i], 0, sizeof(WAVEHDR));
+            headers[i].lpData = reinterpret_cast<LPSTR>(buffers[i].data());
+            headers[i].dwBufferLength = static_cast<DWORD>(buffers[i].size() * sizeof(std::int16_t));
+            waveOutPrepareHeader(waveOut, &headers[i], sizeof(WAVEHDR));
+            waveOutWrite(waveOut, &headers[i], sizeof(WAVEHDR));
+        }
+
+        while (WaitForSingleObject(stopEvent_, 1) == WAIT_TIMEOUT) {
+            WaitForSingleObject(doneEvent, 10);
+            for (std::size_t i = 0; i < kBufferCount; ++i) {
+                if ((headers[i].dwFlags & WHDR_DONE) == 0) {
+                    continue;
+                }
+
+                waveOutUnprepareHeader(waveOut, &headers[i], sizeof(WAVEHDR));
+                FillBuffer(buffers[i].data(), kFramesPerBuffer);
+                std::memset(&headers[i], 0, sizeof(WAVEHDR));
+                headers[i].lpData = reinterpret_cast<LPSTR>(buffers[i].data());
+                headers[i].dwBufferLength = static_cast<DWORD>(buffers[i].size() * sizeof(std::int16_t));
+                waveOutPrepareHeader(waveOut, &headers[i], sizeof(WAVEHDR));
+                waveOutWrite(waveOut, &headers[i], sizeof(WAVEHDR));
+            }
+        }
+
+        waveOutReset(waveOut);
+        for (auto& header : headers) {
+            if ((header.dwFlags & WHDR_PREPARED) != 0) {
+                waveOutUnprepareHeader(waveOut, &header, sizeof(WAVEHDR));
+            }
+        }
+        waveOutClose(waveOut);
+        CloseHandle(doneEvent);
+        return 0;
+    }
+
+    void FillBuffer(std::int16_t* output, std::size_t frames) {
+        std::vector<Voice> voices;
+        EnterCriticalSection(&voicesLock_);
+        voices = voices_;
+        LeaveCriticalSection(&voicesLock_);
+
+        if (samples_.empty() || totalFrames_ == 0 || voices.empty()) {
+            std::memset(output, 0, frames * 2 * sizeof(std::int16_t));
+            playbackFrame_ = (playbackFrame_ + static_cast<std::uint32_t>(frames)) % std::max<std::uint32_t>(1, totalFrames_);
+            return;
+        }
+
+        const int divisor = std::max(1, static_cast<int>(std::sqrt(static_cast<double>(voices.size()))));
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            int mixedLeft = 0;
+            int mixedRight = 0;
+
+            for (const auto& voice : voices) {
+                const auto sourceFrame = static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(playbackFrame_) + frame + voice.offsetFrames) %
+                    static_cast<std::uint64_t>(totalFrames_));
+                const auto sampleIndex = static_cast<std::size_t>(sourceFrame) * sourceChannels_;
+                const int left = samples_[sampleIndex];
+                const int right = sourceChannels_ > 1 ? samples_[sampleIndex + 1] : left;
+                mixedLeft += left;
+                mixedRight += right;
+            }
+
+            mixedLeft = std::clamp(mixedLeft / divisor, -32768, 32767);
+            mixedRight = std::clamp(mixedRight / divisor, -32768, 32767);
+            output[frame * 2] = static_cast<std::int16_t>(mixedLeft);
+            output[frame * 2 + 1] = static_cast<std::int16_t>(mixedRight);
+        }
+
+        playbackFrame_ = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(playbackFrame_) + frames) %
+            static_cast<std::uint64_t>(totalFrames_));
+    }
+
+    bool LoadWave(const std::wstring& path) {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        LARGE_INTEGER fileSize{};
+        if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > 64ll * 1024ll * 1024ll) {
+            CloseHandle(file);
+            return false;
+        }
+
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fileSize.QuadPart));
+        DWORD read = 0;
+        const BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr);
+        CloseHandle(file);
+        if (!ok || read != bytes.size() || bytes.size() < 44) {
+            return false;
+        }
+
+        if (std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
+            return false;
+        }
+
+        WORD audioFormat = 0;
+        WORD channels = 0;
+        DWORD sampleRate = 0;
+        WORD bitsPerSample = 0;
+        std::size_t dataOffset = 0;
+        std::size_t dataSize = 0;
+
+        std::size_t offset = 12;
+        while (offset + 8 <= bytes.size()) {
+            const char* chunkId = reinterpret_cast<const char*>(bytes.data() + offset);
+            const DWORD chunkSize =
+                static_cast<DWORD>(bytes[offset + 4]) |
+                (static_cast<DWORD>(bytes[offset + 5]) << 8) |
+                (static_cast<DWORD>(bytes[offset + 6]) << 16) |
+                (static_cast<DWORD>(bytes[offset + 7]) << 24);
+            const std::size_t chunkData = offset + 8;
+            if (chunkData + chunkSize > bytes.size()) {
+                break;
+            }
+
+            if (std::memcmp(chunkId, "fmt ", 4) == 0 && chunkSize >= 16) {
+                audioFormat = ReadU16(bytes, chunkData);
+                channels = ReadU16(bytes, chunkData + 2);
+                sampleRate = ReadU32(bytes, chunkData + 4);
+                bitsPerSample = ReadU16(bytes, chunkData + 14);
+            } else if (std::memcmp(chunkId, "data", 4) == 0) {
+                dataOffset = chunkData;
+                dataSize = chunkSize;
+            }
+
+            offset = chunkData + chunkSize + (chunkSize & 1u);
+        }
+
+        if (audioFormat != WAVE_FORMAT_PCM || (channels != 1 && channels != 2) || sampleRate == 0 ||
+            bitsPerSample != 16 || dataOffset == 0 || dataSize < channels * sizeof(std::int16_t)) {
+            return false;
+        }
+
+        sourceChannels_ = channels;
+        sampleRate_ = sampleRate;
+        samples_.resize(dataSize / sizeof(std::int16_t));
+        std::memcpy(samples_.data(), bytes.data() + dataOffset, samples_.size() * sizeof(std::int16_t));
+        totalFrames_ = static_cast<std::uint32_t>(samples_.size() / sourceChannels_);
+        playbackFrame_ = 0;
+        return totalFrames_ > 0;
+    }
+
+    static WORD ReadU16(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+        return static_cast<WORD>(bytes[offset] | (bytes[offset + 1] << 8));
+    }
+
+    static DWORD ReadU32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+        return
+            static_cast<DWORD>(bytes[offset]) |
+            (static_cast<DWORD>(bytes[offset + 1]) << 8) |
+            (static_cast<DWORD>(bytes[offset + 2]) << 16) |
+            (static_cast<DWORD>(bytes[offset + 3]) << 24);
+    }
+
     std::wstring path_;
+    HANDLE thread_ = nullptr;
+    HANDLE stopEvent_ = nullptr;
+    CRITICAL_SECTION voicesLock_{};
+    std::vector<Voice> voices_;
+    std::vector<std::int16_t> samples_;
+    WORD sourceChannels_ = 2;
+    DWORD sampleRate_ = 48000;
+    std::uint32_t totalFrames_ = 0;
+    std::uint32_t playbackFrame_ = 0;
 };
 
 HINSTANCE g_instance = nullptr;
@@ -468,7 +831,6 @@ VideoPlayback g_video;
 AudioPlayback g_audio;
 std::vector<std::unique_ptr<WindowState>> g_windows;
 std::mt19937 g_rng{std::random_device{}()};
-bool g_destroyingAll = false;
 bool g_helpOnly = false;
 int g_nextWindowId = 1;
 
@@ -685,7 +1047,9 @@ void DrawScene(HDC targetDc, const RECT& clientRect) {
     const int width = clientRect.right - clientRect.left;
     const int height = clientRect.bottom - clientRect.top;
 
+    g_video.LockFrame();
     if (!g_video.HasFrame()) {
+        g_video.UnlockFrame();
         HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
         FillRect(targetDc, &clientRect, brush);
         DeleteObject(brush);
@@ -707,6 +1071,7 @@ void DrawScene(HDC targetDc, const RECT& clientRect) {
             g_video.Pixels(),
             &g_video.BitmapInfo(),
             DIB_RGB_COLORS);
+        g_video.UnlockFrame();
         return;
     }
 
@@ -724,14 +1089,13 @@ void DrawScene(HDC targetDc, const RECT& clientRect) {
         &g_video.BitmapInfo(),
         DIB_RGB_COLORS,
         SRCCOPY);
+    g_video.UnlockFrame();
 }
 
 std::wstring OptionsText() {
     return
         L"Native Windows prank options:\n\n"
-        L"--windows N    Number of prank windows, 1..24. Default: 10\n"
         L"--fps N        Animation timer rate, 15..240. Default: 120\n"
-        L"--spawn-ms N   Delay between clones, 250..10000. Default: 700\n"
         L"--media PATH   MP4 file to decode. Default: media\\youare.mp4\n"
         L"--audio PATH   WAV file to loop. Default: media\\youare.wav\n"
         L"--no-topmost   Do not keep windows above other windows.\n"
@@ -787,11 +1151,6 @@ void ParseCommandLine() {
             if (readInt(value)) {
                 g_settings.fps = std::clamp(value, 15, 240);
             }
-        } else if (arg == L"--spawn-ms") {
-            int value = g_settings.spawnMs;
-            if (readInt(value)) {
-                g_settings.spawnMs = std::clamp(value, 250, 10000);
-            }
         } else if (arg == L"--media") {
             g_settings.mediaPath = readString();
         } else if (arg == L"--audio") {
@@ -805,7 +1164,6 @@ void ParseCommandLine() {
         } else if (arg == L"--calm") {
             g_settings.maxWindows = 3;
             g_settings.fps = 30;
-            g_settings.spawnMs = 1800;
             g_settings.topmost = false;
             g_settings.sound = false;
             g_settings.dodgeCursor = false;
@@ -836,9 +1194,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         state->lastFrameAt = GetTickCount64();
         if (state->root) {
             SetTimer(hwnd, kFrameTimer, TimerIntervalMs(), nullptr);
-            if (g_settings.maxWindows > 1) {
-                SetTimer(hwnd, kSpawnTimer, static_cast<UINT>(g_settings.spawnMs), nullptr);
-            }
         }
         return 0;
 
@@ -848,16 +1203,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
 
         if (wParam == kFrameTimer) {
-            g_video.Advance();
             for (const auto& window : g_windows) {
                 StepWindow(*window);
                 InvalidateRect(window->hwnd, nullptr, FALSE);
-            }
-        } else if (wParam == kSpawnTimer) {
-            if (static_cast<int>(g_windows.size()) < g_settings.maxWindows) {
-                CreatePrankWindow(false);
-            } else {
-                KillTimer(hwnd, kSpawnTimer);
             }
         }
         return 0;
@@ -888,7 +1236,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_NCDESTROY:
         if (state != nullptr) {
             KillTimer(hwnd, kFrameTimer);
-            KillTimer(hwnd, kSpawnTimer);
+            g_audio.RemoveVoice(state->audioVoiceId);
 
             g_windows.erase(
                 std::remove_if(
@@ -916,6 +1264,7 @@ HWND CreatePrankWindow(bool root) {
     auto state = std::make_unique<WindowState>();
     state->root = root;
     state->id = g_nextWindowId++;
+    state->audioVoiceId = static_cast<std::uint32_t>(state->id);
 
     DWORD exStyle = WS_EX_APPWINDOW;
     if (g_settings.topmost) {
@@ -966,6 +1315,7 @@ HWND CreatePrankWindow(bool root) {
 
     ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
+    g_audio.AddVoice(rawState->audioVoiceId);
     return hwnd;
 }
 
@@ -1010,13 +1360,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     const std::wstring mediaPath = ResolveMediaPath();
-    hr = g_video.Open(mediaPath);
+    hr = g_video.Start(mediaPath);
     if (FAILED(hr)) {
         std::wstring message = L"Could not decode the prank video:\n";
         message += mediaPath;
         message += L"\n\n";
         message += g_video.Error();
-        g_video.Close();
+        g_video.Stop();
         MFShutdown();
         CoUninitialize();
         MessageBoxW(nullptr, message.c_str(), L"You are an idiot!", MB_OK | MB_ICONERROR);
@@ -1029,16 +1379,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     if (!RegisterWindowClass()) {
         g_audio.Stop();
-        g_video.Close();
+        g_video.Stop();
         MFShutdown();
         CoUninitialize();
         MessageBoxW(nullptr, L"Could not register the prank window class.", L"You are an idiot!", MB_OK | MB_ICONERROR);
         return 1;
     }
 
+    const bool timerResolutionSet = timeBeginPeriod(1) == TIMERR_NOERROR;
+
     if (CreatePrankWindow(true) == nullptr) {
+        if (timerResolutionSet) {
+            timeEndPeriod(1);
+        }
         g_audio.Stop();
-        g_video.Close();
+        g_video.Stop();
         MFShutdown();
         CoUninitialize();
         MessageBoxW(nullptr, L"Could not create the prank window.", L"You are an idiot!", MB_OK | MB_ICONERROR);
@@ -1062,8 +1417,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (hotkeyRegistered) {
         UnregisterHotKey(nullptr, kQuitHotkeyId);
     }
+    if (timerResolutionSet) {
+        timeEndPeriod(1);
+    }
     g_audio.Stop();
-    g_video.Close();
+    g_video.Stop();
     MFShutdown();
     CoUninitialize();
     return static_cast<int>(message.wParam);
