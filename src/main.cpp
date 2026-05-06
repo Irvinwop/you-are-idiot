@@ -5,6 +5,7 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -21,9 +22,9 @@ namespace {
 
 constexpr wchar_t kWindowClass[] = L"YouAreIdiotNativeWindow";
 constexpr wchar_t kDefaultMediaPath[] = L"media\\youare.mp4";
+constexpr wchar_t kDefaultAudioPath[] = L"media\\youare.wav";
 constexpr UINT_PTR kFrameTimer = 1;
 constexpr UINT_PTR kSpawnTimer = 2;
-constexpr UINT_PTR kBeepTimer = 3;
 constexpr int kQuitHotkeyId = 100;
 constexpr int kArrowCursorResource = 32512;
 constexpr int kWarningIconResource = 32515;
@@ -76,12 +77,13 @@ private:
 
 struct Settings {
     unsigned int maxWindows = -1;
-    int fps = 60;
+    int fps = 120;
     int spawnMs = 700;
     bool topmost = true;
     bool sound = true;
     bool dodgeCursor = true;
     std::wstring mediaPath;
+    std::wstring audioPath;
 };
 
 struct WindowState {
@@ -200,6 +202,15 @@ public:
 
 private:
     HRESULT ConfigureRgbOutput() {
+        HRESULT hr = ConfigureRgbOutput(kClientWidth, kClientHeight);
+        if (SUCCEEDED(hr)) {
+            return S_OK;
+        }
+
+        return ConfigureRgbOutput(0, 0);
+    }
+
+    HRESULT ConfigureRgbOutput(UINT32 outputWidth, UINT32 outputHeight) {
         ComPtr<IMFMediaType> mediaType;
         HRESULT hr = MFCreateMediaType(mediaType.Put());
         if (FAILED(hr)) {
@@ -214,6 +225,14 @@ private:
         if (FAILED(hr)) {
             SetError(L"Could not configure RGB32 output type", hr);
             return hr;
+        }
+
+        if (outputWidth > 0 && outputHeight > 0) {
+            hr = MFSetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, outputWidth, outputHeight);
+            if (FAILED(hr)) {
+                SetError(L"Could not configure scaled RGB32 output size", hr);
+                return hr;
+            }
         }
 
         hr = reader_->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, mediaType.Get());
@@ -417,9 +436,36 @@ private:
     std::wstring error_;
 };
 
+bool FileExists(const std::wstring& path);
+
+class AudioPlayback {
+public:
+    bool Start(const std::wstring& path) {
+        path_ = path;
+        if (!FileExists(path_)) {
+            return false;
+        }
+
+        playing_ = PlaySoundW(path_.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_LOOP | SND_NODEFAULT) != FALSE;
+        return playing_;
+    }
+
+    void Stop() {
+        if (playing_) {
+            PlaySoundW(nullptr, nullptr, 0);
+            playing_ = false;
+        }
+    }
+
+private:
+    bool playing_ = false;
+    std::wstring path_;
+};
+
 HINSTANCE g_instance = nullptr;
 Settings g_settings;
 VideoPlayback g_video;
+AudioPlayback g_audio;
 std::vector<std::unique_ptr<WindowState>> g_windows;
 std::mt19937 g_rng{std::random_device{}()};
 bool g_destroyingAll = false;
@@ -474,6 +520,23 @@ std::wstring ResolveMediaPath() {
     return besideExecutable;
 }
 
+std::wstring ResolveAudioPath() {
+    if (!g_settings.audioPath.empty()) {
+        return g_settings.audioPath;
+    }
+
+    const std::wstring besideExecutable = ModuleDirectory() + L"\\" + kDefaultAudioPath;
+    if (FileExists(besideExecutable)) {
+        return besideExecutable;
+    }
+
+    if (FileExists(kDefaultAudioPath)) {
+        return kDefaultAudioPath;
+    }
+
+    return besideExecutable;
+}
+
 RECT VirtualScreenBounds() {
     RECT rect{};
     rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -495,16 +558,16 @@ void ComputeOuterWindowSize(DWORD style, DWORD exStyle, int& width, int& height)
 }
 
 void SetRandomVelocity(WindowState& state) {
-    const double speed = RandomDouble(520.0, 920.0);
+    const double speed = RandomDouble(1400.0, 2600.0);
     const double angle = RandomDouble(0.35, 5.95);
     state.vx = std::cos(angle) * speed;
     state.vy = std::sin(angle) * speed;
 
-    if (std::abs(state.vx) < 240.0) {
-        state.vx = std::copysign(240.0, state.vx == 0.0 ? 1.0 : state.vx);
+    if (std::abs(state.vx) < 650.0) {
+        state.vx = std::copysign(650.0, state.vx == 0.0 ? 1.0 : state.vx);
     }
-    if (std::abs(state.vy) < 180.0) {
-        state.vy = std::copysign(180.0, state.vy == 0.0 ? 1.0 : state.vy);
+    if (std::abs(state.vy) < 500.0) {
+        state.vy = std::copysign(500.0, state.vy == 0.0 ? 1.0 : state.vy);
     }
 }
 
@@ -520,21 +583,21 @@ void Bounce(WindowState& state, const RECT& bounds) {
 
     if (state.x <= bounds.left) {
         state.x = bounds.left;
-        state.vx = std::abs(state.vx) + RandomDouble(40.0, 160.0);
+        state.vx = std::abs(state.vx) + RandomDouble(120.0, 360.0);
         bounced = true;
     } else if (state.x + state.width >= bounds.right) {
         state.x = bounds.right - state.width;
-        state.vx = -std::abs(state.vx) - RandomDouble(40.0, 160.0);
+        state.vx = -std::abs(state.vx) - RandomDouble(120.0, 360.0);
         bounced = true;
     }
 
     if (state.y <= bounds.top) {
         state.y = bounds.top;
-        state.vy = std::abs(state.vy) + RandomDouble(40.0, 160.0);
+        state.vy = std::abs(state.vy) + RandomDouble(120.0, 360.0);
         bounced = true;
     } else if (state.y + state.height >= bounds.bottom) {
         state.y = bounds.bottom - state.height;
-        state.vy = -std::abs(state.vy) - RandomDouble(40.0, 160.0);
+        state.vy = -std::abs(state.vy) - RandomDouble(120.0, 360.0);
         bounced = true;
     }
 
@@ -579,7 +642,7 @@ void DodgeCursor(WindowState& state) {
         dy /= length;
     }
 
-    const double speed = RandomDouble(900.0, 1250.0);
+    const double speed = RandomDouble(1800.0, 3200.0);
     state.vx = dx * speed;
     state.vy = dy * speed;
 }
@@ -592,7 +655,7 @@ void StepWindow(WindowState& state) {
 
     double dt = static_cast<double>(now - state.lastFrameAt) / 1000.0;
     state.lastFrameAt = now;
-    dt = std::clamp(dt, 0.001, 0.05);
+    dt = std::clamp(dt, 0.001, 0.025);
 
     DodgeCursor(state);
     state.x += state.vx * dt;
@@ -629,8 +692,24 @@ void DrawScene(HDC targetDc, const RECT& clientRect) {
         return;
     }
 
-    SetStretchBltMode(targetDc, HALFTONE);
-    SetBrushOrgEx(targetDc, 0, 0, nullptr);
+    SetStretchBltMode(targetDc, COLORONCOLOR);
+    if (width == g_video.Width() && height == g_video.Height()) {
+        SetDIBitsToDevice(
+            targetDc,
+            0,
+            0,
+            width,
+            height,
+            0,
+            0,
+            0,
+            static_cast<UINT>(g_video.Height()),
+            g_video.Pixels(),
+            &g_video.BitmapInfo(),
+            DIB_RGB_COLORS);
+        return;
+    }
+
     StretchDIBits(
         targetDc,
         0,
@@ -651,11 +730,12 @@ std::wstring OptionsText() {
     return
         L"Native Windows prank options:\n\n"
         L"--windows N    Number of prank windows, 1..24. Default: 10\n"
-        L"--fps N        Animation timer rate, 15..144. Default: 60\n"
+        L"--fps N        Animation timer rate, 15..240. Default: 120\n"
         L"--spawn-ms N   Delay between clones, 250..10000. Default: 700\n"
         L"--media PATH   MP4 file to decode. Default: media\\youare.mp4\n"
+        L"--audio PATH   WAV file to loop. Default: media\\youare.wav\n"
         L"--no-topmost   Do not keep windows above other windows.\n"
-        L"--no-sound     Disable system beeps.\n"
+        L"--no-sound     Disable audio playback.\n"
         L"--no-dodge     Disable cursor dodge behavior.\n"
         L"--calm         Lower-impact profile for testing.\n"
         L"--help         Show this help.\n\n"
@@ -705,7 +785,7 @@ void ParseCommandLine() {
         } else if (arg == L"--fps") {
             int value = g_settings.fps;
             if (readInt(value)) {
-                g_settings.fps = std::clamp(value, 15, 144);
+                g_settings.fps = std::clamp(value, 15, 240);
             }
         } else if (arg == L"--spawn-ms") {
             int value = g_settings.spawnMs;
@@ -714,6 +794,8 @@ void ParseCommandLine() {
             }
         } else if (arg == L"--media") {
             g_settings.mediaPath = readString();
+        } else if (arg == L"--audio") {
+            g_settings.audioPath = readString();
         } else if (arg == L"--no-topmost") {
             g_settings.topmost = false;
         } else if (arg == L"--no-sound") {
@@ -752,13 +834,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
     case WM_CREATE:
         state->lastFrameAt = GetTickCount64();
-        SetTimer(hwnd, kFrameTimer, TimerIntervalMs(), nullptr);
         if (state->root) {
+            SetTimer(hwnd, kFrameTimer, TimerIntervalMs(), nullptr);
             if (g_settings.maxWindows > 1) {
                 SetTimer(hwnd, kSpawnTimer, static_cast<UINT>(g_settings.spawnMs), nullptr);
-            }
-            if (g_settings.sound) {
-                SetTimer(hwnd, kBeepTimer, 560, nullptr);
             }
         }
         return 0;
@@ -770,16 +849,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
         if (wParam == kFrameTimer) {
             g_video.Advance();
-            StepWindow(*state);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            for (const auto& window : g_windows) {
+                StepWindow(*window);
+                InvalidateRect(window->hwnd, nullptr, FALSE);
+            }
         } else if (wParam == kSpawnTimer) {
             if (static_cast<int>(g_windows.size()) < g_settings.maxWindows) {
                 CreatePrankWindow(false);
             } else {
                 KillTimer(hwnd, kSpawnTimer);
             }
-        } else if (wParam == kBeepTimer && g_settings.sound) {
-            MessageBeep(MB_ICONEXCLAMATION);
         }
         return 0;
 
@@ -810,7 +889,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (state != nullptr) {
             KillTimer(hwnd, kFrameTimer);
             KillTimer(hwnd, kSpawnTimer);
-            KillTimer(hwnd, kBeepTimer);
 
             g_windows.erase(
                 std::remove_if(
@@ -945,7 +1023,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    if (g_settings.sound) {
+        g_audio.Start(ResolveAudioPath());
+    }
+
     if (!RegisterWindowClass()) {
+        g_audio.Stop();
         g_video.Close();
         MFShutdown();
         CoUninitialize();
@@ -954,6 +1037,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     if (CreatePrankWindow(true) == nullptr) {
+        g_audio.Stop();
         g_video.Close();
         MFShutdown();
         CoUninitialize();
@@ -978,6 +1062,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (hotkeyRegistered) {
         UnregisterHotKey(nullptr, kQuitHotkeyId);
     }
+    g_audio.Stop();
     g_video.Close();
     MFShutdown();
     CoUninitialize();

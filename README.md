@@ -1,6 +1,6 @@
 # You Are Idiot Native
 
-Native Windows C++ version of the browser prank. It uses one Win32 process, Media Foundation frame decoding, direct GDI `StretchDIBits` painting, timer-driven window motion, capped clone windows, topmost mode, and system beeps.
+Native Windows C++ version of the browser prank. It uses one Win32 process, Media Foundation frame decoding, direct GDI painting, timer-driven window motion, capped clone windows, topmost mode, and looped PCM audio.
 
 It does not install persistence, modify the system, disable tools, or write outside the process. Press `Esc` in any prank window, or `Ctrl+Shift+Q` from anywhere, to close everything.
 
@@ -24,11 +24,12 @@ cmake --build build-mingw
 
 ```text
 --windows N    Number of prank windows, clamped to 1..24. Default: 10
---fps N        Animation timer rate, clamped to 15..144. Default: 60
+--fps N        Animation timer rate, clamped to 15..240. Default: 120
 --spawn-ms N   Delay between clone windows, clamped to 250..10000. Default: 700
 --media PATH   MP4 file to decode. Default: media\youare.mp4
+--audio PATH   WAV file to loop. Default: media\youare.wav
 --no-topmost   Do not keep prank windows above other windows.
---no-sound     Disable system beeps.
+--no-sound     Disable audio playback.
 --no-dodge     Disable cursor dodge behavior.
 --calm         Lower-impact profile for testing.
 --help         Show option help.

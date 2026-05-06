@@ -17,6 +17,7 @@ target_link_libraries(you_are_idiot PRIVATE
     ole32
     shell32
     user32
+    winmm
 )
 
 add_custom_command(TARGET you_are_idiot POST_BUILD
@@ -24,6 +25,9 @@ add_custom_command(TARGET you_are_idiot POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/media/youare.mp4"
         "$<TARGET_FILE_DIR:you_are_idiot>/media/youare.mp4"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/media/youare.wav"
+        "$<TARGET_FILE_DIR:you_are_idiot>/media/youare.wav"
 )
 
 if(MSVC)
